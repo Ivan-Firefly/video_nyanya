@@ -1,0 +1,15 @@
+services:
+  vdoninja-monitor:
+    image: yourdockerhubuser/your-repo-name:latest
+    restart: unless-stopped
+    network_mode: host   # без NAT-оверхеда и без ручного маппинга портов
+    shm_size: "512mb"     # увеличено против дефолтных 64 МБ Docker для Chromium
+    environment:
+      - REMOTE_DEBUG_PORT=9223
+    volumes:
+      # HTML лежит рядом с этим compose-файлом под именем monitor.html
+      - ./monitor.html:/app/html/monitor.html:ro
+      # Персистентный профиль браузера — сохраняет localStorage/настройки между перезапусками
+      - ./browser-profile:/app/browser-profile
+      # Логи наружу, чтобы не терялись при пересборке контейнера
+      - ./logs:/app/logs
