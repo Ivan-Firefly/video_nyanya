@@ -3,7 +3,6 @@ services:
     image: firefly27/video_nyanya:latest
     restart: unless-stopped
     network_mode: host   # без NAT-оверхеда и без ручного маппинга портов
-    shm_size: "512mb"     # увеличено против дефолтных 64 МБ Docker для Chromium
     environment:
       - REMOTE_DEBUG_PORT=9223
     volumes:
