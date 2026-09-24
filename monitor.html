@@ -92,8 +92,7 @@ const TELEGRAMBOTTOKEN = "BOT_TOKEN"; // токен от BotFather
 // Жёстко забитые получатели: Имя -> chat_id. В дропдауне видно только имя.
 const TELEGRAM_USERS = [
   { name: "Я",    chatId: "111111111" },
-  { name: "Жена", chatId: "222222222" },
-  { name: "Няня", chatId: "333333333" }
+  { name: "Женя", chatId: "222222222" }
 ];
 const CUSTOM_OPTION_VALUE = "__custom__";
 
@@ -114,7 +113,7 @@ const DEFAULTS = {
   chatSelections: TELEGRAM_USERS.length ? [TELEGRAM_USERS[0].chatId] : [],
   customChatEnabled: false,
   chatCustom: "",
-  loudness: -25,
+  loudness: 10,
   soundCooldown: 30000,
   resolution: "240x135",
   pixelDiff: 30,
