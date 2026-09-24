@@ -4,7 +4,7 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      - HTTP_PORT=8765          # порт веб-интерфейса настроек, можно поменять
+      - HTTP_PORT=8050          # порт веб-интерфейса настроек, можно поменять
     volumes:
       - ./monitor.html:/app/html/monitor.html:ro
       - ./browser-profile:/app/browser-profile
