@@ -6,6 +6,9 @@ services:
     network_mode: host
     environment:
       - HTTP_PORT=8050          # порт веб-интерфейса настроек, можно поменять
+      - START_CONFIRM_SEC=5
+      - HEALTHCHECK_INTERVAL_SEC=5
+      - NOTIFY_MIN_GAP_SEC=30
     volumes:
       - ./monitor.html:/app/html/monitor.html:ro
       - ./browser-profile:/app/browser-profile
