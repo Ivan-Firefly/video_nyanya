@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VDO.Ninja → Telegram trigger</title>
+<style>
+  html,body{margin:0;padding:0;background:#111;color:#eee;font-family:system-ui,sans-serif;
+             min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px}
+  #startBtn{font-size:18px;padding:14px 28px;border-radius:10px;border:0;background:#2b8a3e;color:#fff}
+  #status{position:fixed;left:4px;bottom:4px;font-size:12px;opacity:.6;display:none;max-width:90vw;word-break:break-all}
+  #vdoFrame{position:fixed;top:0;left:0;width:2px;height:2px;border:0;opacity:0.01;pointer-events:none}
+
+  #settingsToggle{position:fixed;top:8px;right:8px;background:#333;color:#eee;border:0;border-radius:6px;
+                   width:32px;height:32px;font-size:16px}
+  #settingsPanel{position:fixed;top:48px;right:8px;background:#1b1b1b;border:1px solid #333;border-radius:10px;
+                  padding:12px;font-size:13px;width:250px;display:none;max-height:85vh;overflow:auto}
+  #settingsPanel label{display:block;margin-top:8px;color:#9c9;font-size:11px}
+  #settingsPanel input, #settingsPanel select{width:100%;box-sizing:border-box;padding:6px;margin-top:2px;
+                        background:#111;color:#eee;border:1px solid #333;border-radius:6px;font-size:13px}
+  #settingsPanel .hint{font-size:10px;color:#777;margin-top:2px}
+  #saveBtn{width:100%;margin-top:14px;padding:10px;border:0;border-radius:8px;background:#2b6ba3;
+           color:#fff;font-size:13px}
+  #saveHint{font-size:10px;color:#e0a030;margin-top:6px;display:none}
+
+  #chatDropdownWrap{position:relative;margin-top:2px}
+  #chatDropdownBtn{width:100%;box-sizing:border-box;padding:6px;background:#111;color:#eee;
+                    border:1px solid #333;border-radius:6px;font-size:13px;text-align:left;cursor:pointer}
+  #chatDropdownList{display:none;position:absolute;top:100%;left:0;right:0;background:#151515;
+                     border:1px solid #333;border-radius:6px;margin-top:2px;z-index:20;max-height:220px;overflow:auto}
+  #chatDropdownList label{display:flex;align-items:center;gap:6px;padding:7px 8px;margin:0;color:#eee;
+                           font-size:13px;cursor:pointer}
+  #chatDropdownList label:hover{background:#222}
+  #chatDropdownList input[type=checkbox]{width:auto;margin:0}
+  #customChatWrap{display:none}
+</style>
+</head>
+<body>
+<button id="startBtn">Включить мониторинг</button>
+<div id="status">armed</div>
+
+<button id="settingsToggle" title="Настройки">⚙</button>
+<div id="settingsPanel">
+  <label>ID трансляции VDO.Ninja
+    <input type="text" id="cfgViewId">
+    <div class="hint">часть после ?view= в ссылке</div>
+  </label>
+
+  <label>Получатели в Telegram
+    <div id="chatDropdownWrap">
+      <button type="button" id="chatDropdownBtn">Выбрать...</button>
+      <div id="chatDropdownList"></div>
+    </div>
+  </label>
+  <div id="customChatWrap">
+    <label>Chat ID вручную (можно несколько через запятую)
+      <input type="text" id="cfgChatCustom" placeholder="например 123456789, 987654321">
+    </label>
+  </div>
+
+  <label>Порог громкости, дБ
+    <input type="number" id="cfgLoudness" step="1">
+  </label>
+  <label>Антидребезг звука, мс
+    <input type="number" id="cfgSoundCooldown" step="1000">
+  </label>
+
+  <label>Разрешение видео (детекция движения)
+    <select id="cfgResolution"></select>
+    <div class="hint" id="resolutionHint"></div>
+  </label>
+  <label>Порог одного пикселя, 0-255
+    <input type="number" id="cfgPixelDiff" step="5" min="0" max="255">
+    <div class="hint">меньше = чувствительнее к шуму камеры</div>
+  </label>
+  <label>Порог кадра, %
+    <input type="number" id="cfgPercent" step="5" min="1" max="100">
+    <div class="hint">доля изменившихся пикселей для срабатывания</div>
+  </label>
+  <label>Антидребезг движения, мс
+    <input type="number" id="cfgMotionCooldown" step="1000">
+  </label>
+
+  <button id="saveBtn">Сохранить и перезапустить</button>
+  <div id="saveHint">Настройки сохранены — мониторинг придётся включить кнопкой заново после перезагрузки.</div>
+</div>
+
+<script>
+/* ============ НАСТРОЙКИ ПОДКЛЮЧЕНИЯ (не меняются через панель) ============ */
+const TELEGRAMBOTTOKEN = "BOT_TOKEN"; // токен от BotFather
+
+// Жёстко забитые получатели: Имя -> chat_id. В дропдауне видно только имя.
+const TELEGRAM_USERS = [
+  { name: "Я",    chatId: "111111111" },
+  { name: "Жена", chatId: "222222222" },
+  { name: "Няня", chatId: "333333333" }
+];
+const CUSTOM_OPTION_VALUE = "__custom__";
+
+// Разрешение видео и размер сравнения кадра связаны формулой: sampleSize = width / 5.
+const RESOLUTION_PRESETS = [
+  { key: "160x90",  width: 160, height: 90,  label: "160×90 — низкое (минимум CPU)" },
+  { key: "240x135", width: 240, height: 135, label: "240×135 — среднее" },
+  { key: "320x180", width: 320, height: 180, label: "320×180 — высокое" },
+  { key: "480x270", width: 480, height: 270, label: "480×270 — максимальное" }
+];
+function sampleSizeForWidth(width) {
+  return Math.max(16, Math.round(width / 5));
+}
+/* ============================================================================ */
+
+const DEFAULTS = {
+  viewId: "",
+  chatSelections: TELEGRAM_USERS.length ? [TELEGRAM_USERS[0].chatId] : [],
+  customChatEnabled: false,
+  chatCustom: "",
+  loudness: -25,
+  soundCooldown: 30000,
+  resolution: "240x135",
+  pixelDiff: 30,
+  percent: 25,
+  motionCooldown: 30000
+};
+
+function loadSettings() {
+  const saved = JSON.parse(localStorage.getItem('vdoAlertSettings') || '{}');
+  return { ...DEFAULTS, ...saved };
+}
+
+const cfg = loadSettings();
+const resPreset = RESOLUTION_PRESETS.find(r => r.key === cfg.resolution) || RESOLUTION_PRESETS[1];
+const RECEIVE_WIDTH = resPreset.width;
+const RECEIVE_HEIGHT = resPreset.height;
+const SAMPLE_SIZE = sampleSizeForWidth(RECEIVE_WIDTH);
+const DIFF_SUM_THRESHOLD = cfg.pixelDiff * 3;
+
+function getActiveChatIds() {
+  const ids = [...cfg.chatSelections];
+  if (cfg.customChatEnabled && cfg.chatCustom) {
+    cfg.chatCustom.split(',').map(s => s.trim()).filter(Boolean).forEach(id => ids.push(id));
+  }
+  return [...new Set(ids)];
+}
+const ACTIVE_CHAT_IDS = getActiveChatIds();
+
+// Явно выносим в window, чтобы внешний headless-супервизор (Python) мог
+// считать текущий токен и список получателей для служебных уведомлений.
+window.TELEGRAMBOTTOKEN = TELEGRAMBOTTOKEN;
+window.ACTIVE_CHAT_IDS = ACTIVE_CHAT_IDS;
+
+let lastSoundAlertAt = 0;
+let lastMotionAlertAt = 0;
+let iframe = null;
+let wakeLock = null;
+let prevFrameData = null;
+
+// Heartbeat для внешнего мониторинга (Python-супервизор):
+window.__lastMessageAt = null;
+window.__connectedAt = null;
+
+const canvas = document.createElement('canvas');
+canvas.width = SAMPLE_SIZE;
+canvas.height = SAMPLE_SIZE;
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+/* ---- UI: кастомный дропдаун получателей с галочками ---- */
+const dropdownBtn = document.getElementById('chatDropdownBtn');
+const dropdownList = document.getElementById('chatDropdownList');
+
+TELEGRAM_USERS.forEach(u => {
+  const label = document.createElement('label');
+  label.innerHTML = `<input type="checkbox" value="${u.chatId}"> ${u.name}`;
+  dropdownList.appendChild(label);
+});
+const customLabel = document.createElement('label');
+customLabel.innerHTML = `<input type="checkbox" id="chatCustomToggle"> Задать вручную`;
+dropdownList.appendChild(customLabel);
+
+function restoreDropdownState() {
+  dropdownList.querySelectorAll('input[type=checkbox]').forEach(cb => {
+    if (cb.id === 'chatCustomToggle') {
+      cb.checked = cfg.customChatEnabled;
+    } else {
+      cb.checked = cfg.chatSelections.includes(cb.value);
+    }
+  });
+  document.getElementById('cfgChatCustom').value = cfg.chatCustom;
+  document.getElementById('customChatWrap').style.display = cfg.customChatEnabled ? 'block' : 'none';
+  updateDropdownButtonLabel();
+}
+
+function updateDropdownButtonLabel() {
+  const names = [];
+  TELEGRAM_USERS.forEach(u => {
+    const cb = dropdownList.querySelector(`input[value="${u.chatId}"]`);
+    if (cb && cb.checked) names.push(u.name);
+  });
+  const customCb = document.getElementById('chatCustomToggle');
+  if (customCb && customCb.checked) names.push('вручную');
+  dropdownBtn.textContent = names.length ? names.join(', ') : 'Никто не выбран';
+}
+
+dropdownList.addEventListener('change', (e) => {
+  if (e.target.id === 'chatCustomToggle') {
+    document.getElementById('customChatWrap').style.display = e.target.checked ? 'block' : 'none';
+  }
+  updateDropdownButtonLabel();
+});
+
+dropdownBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  dropdownList.style.display = dropdownList.style.display === 'block' ? 'none' : 'block';
+});
+document.addEventListener('click', (e) => {
+  if (!dropdownList.contains(e.target) && e.target !== dropdownBtn) {
+    dropdownList.style.display = 'none';
+  }
+});
+
+restoreDropdownState();
+
+/* ---- UI: разрешение видео ---- */
+const resSelect = document.getElementById('cfgResolution');
+RESOLUTION_PRESETS.forEach(r => {
+  const opt = document.createElement('option');
+  opt.value = r.key;
+  opt.textContent = r.label;
+  resSelect.appendChild(opt);
+});
+resSelect.value = cfg.resolution;
+
+function updateResolutionHint() {
+  const r = RESOLUTION_PRESETS.find(x => x.key === resSelect.value);
+  document.getElementById('resolutionHint').textContent =
+    `сравнение кадра: ${sampleSizeForWidth(r.width)}px`;
+}
+updateResolutionHint();
+resSelect.addEventListener('change', updateResolutionHint);
+
+/* ---- UI: остальные простые поля ---- */
+const fields = {
+  cfgViewId: 'viewId',
+  cfgLoudness: 'loudness',
+  cfgSoundCooldown: 'soundCooldown',
+  cfgPixelDiff: 'pixelDiff',
+  cfgPercent: 'percent',
+  cfgMotionCooldown: 'motionCooldown'
+};
+for (const [id, key] of Object.entries(fields)) {
+  document.getElementById(id).value = cfg[key];
+}
+
+document.getElementById('settingsToggle').addEventListener('click', () => {
+  const panel = document.getElementById('settingsPanel');
+  panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+});
+
+document.getElementById('saveBtn').addEventListener('click', () => {
+  const newCfg = {};
+  for (const [id, key] of Object.entries(fields)) {
+    const raw = document.getElementById(id).value;
+    if (key === 'viewId') { newCfg[key] = raw.trim(); continue; }
+    const val = Number(raw);
+    newCfg[key] = Number.isNaN(val) ? DEFAULTS[key] : val;
+  }
+  newCfg.resolution = resSelect.value;
+
+  const selectedIds = [];
+  TELEGRAM_USERS.forEach(u => {
+    const cb = dropdownList.querySelector(`input[value="${u.chatId}"]`);
+    if (cb && cb.checked) selectedIds.push(u.chatId);
+  });
+  newCfg.chatSelections = selectedIds;
+  newCfg.customChatEnabled = document.getElementById('chatCustomToggle').checked;
+  newCfg.chatCustom = document.getElementById('cfgChatCustom').value.trim();
+
+  localStorage.setItem('vdoAlertSettings', JSON.stringify(newCfg));
+  document.getElementById('saveHint').style.display = 'block';
+  setTimeout(() => location.reload(), 600);
+});
+
+/* ---- Wake Lock ---- */
+async function requestWakeLock() {
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && iframe) requestWakeLock();
+});
+
+/* ---- Запуск ---- */
+document.getElementById('startBtn').addEventListener('click', async () => {
+  if (!cfg.viewId) { alert('Укажите ID трансляции в настройках (⚙) перед запуском.'); return; }
+  if (!ACTIVE_CHAT_IDS.length) { alert('Не выбрано ни одного получателя в Telegram.'); return; }
+
+  document.getElementById('startBtn').style.display = 'none';
+  document.getElementById('status').style.display = 'block';
+  await requestWakeLock();
+
+  iframe = document.createElement('iframe');
+  iframe.id = 'vdoFrame';
+  iframe.allow = "autoplay; microphone; camera";
+  // &mutespeaker=1 — глушит слышимый вывод звука в динамик телефона,
+  // но НЕ отключает сам аудиотрек: getLoudness продолжает получать
+  // реальные данные о громкости независимо от воспроизведения.
+  iframe.src = `https://vdo.ninja/?view=${cfg.viewId}&cleanoutput&autostart&mutespeaker=1&viewwidth=${RECEIVE_WIDTH}&viewheight=${RECEIVE_HEIGHT}`;
+  document.body.appendChild(iframe);
+
+  iframe.addEventListener('load', () => {
+    iframe.contentWindow.postMessage({ getLoudness: true }, '*');
+    setInterval(requestFrame, 1500);
+  });
+});
+
+function requestFrame() {
+  if (!iframe) return;
+  iframe.contentWindow.postMessage({ getVideoFrame: true, streamID: cfg.viewId, cib: 'motion' }, '*');
+}
+
+window.addEventListener('message', (e) => {
+  if (!iframe || e.source !== iframe.contentWindow) return;
+  if (!e.data) return;
+
+  window.__lastMessageAt = Date.now();
+  if (e.data.action === 'new-view-connection' || e.data.action === 'view-connection') {
+    window.__connectedAt = window.__connectedAt || Date.now();
+  }
+
+  if (typeof e.data.loudness !== 'undefined' && e.data.mode === 'update') {
+    const levels = Object.values(e.data.loudness);
+    if (levels.length) {
+      const level = Math.max(...levels);
+      if (level > cfg.loudness) {
+        const now = Date.now();
+        if (now - lastSoundAlertAt > cfg.soundCooldown) {
+          lastSoundAlertAt = now;
+          sendTelegramAlert(`🔊 Превышен порог громкости: ${level.toFixed(1)} dB`);
+        }
+      }
+    }
+  }
+
+  if (e.data.action === 'image-frame-capture' && e.data.value && e.data.value.cib === 'motion') {
+    const blob = e.data.value.imageData;
+    if (blob instanceof Blob) processFrame(blob);
+  }
+});
+
+async function processFrame(blob) {
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(blob, {
+      resizeWidth: SAMPLE_SIZE,
+      resizeHeight: SAMPLE_SIZE,
+      resizeQuality: 'low'
+    });
+  } catch (err) {
+    return;
+  }
+
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+
+  const current = ctx.getImageData(0, 0, SAMPLE_SIZE, SAMPLE_SIZE).data;
+
+  if (prevFrameData) {
+    let changed = 0;
+    const totalPixels = SAMPLE_SIZE * SAMPLE_SIZE;
+    for (let i = 0; i < current.length; i += 4) {
+      const sum = Math.abs(current[i] - prevFrameData[i])
+                + Math.abs(current[i+1] - prevFrameData[i+1])
+                + Math.abs(current[i+2] - prevFrameData[i+2]);
+      if (sum > DIFF_SUM_THRESHOLD) changed++;
+    }
+    const percent = (changed / totalPixels) * 100;
+    document.getElementById('status').textContent = `motion: ${percent.toFixed(0)}%`;
+
+    if (percent > cfg.percent) {
+      const now = Date.now();
+      if (now - lastMotionAlertAt > cfg.motionCooldown) {
+        lastMotionAlertAt = now;
+        sendTelegramAlert(`🎥 Обнаружено движение: ${percent.toFixed(0)}% кадра изменилось`);
+      }
+    }
+  }
+  prevFrameData = current;
+}
+
+async function sendTelegramAlert(text) {
+  const results = await Promise.allSettled(
+    ACTIVE_CHAT_IDS.map(chatId =>
+      fetch(`https://api.telegram.org/bot${TELEGRAMBOTTOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text })
+      }).then(res => res.json())
+    )
+  );
+
+  const okCount = results.filter(r => r.status === 'fulfilled' && r.value && r.value.ok).length;
+  const failCount = results.length - okCount;
+  document.getElementById('status').textContent =
+    `sent ${new Date().toLocaleTimeString()} (${okCount}/${results.length} ok${failCount ? ', ' + failCount + ' ошибок' : ''})`;
+}
+</script>
+</body>
+</html>
