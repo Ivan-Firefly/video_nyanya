@@ -39,18 +39,23 @@
   body.settings-mode #settingsToggle{display:none}
   body.settings-mode #serverStatus{display:block}
   body.settings-mode #settingsPanel{display:block;position:static;width:min(420px,92vw);max-height:none}
+
+  #toast{display:none;position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:50;max-width:90vw;
+         padding:12px 18px;border-radius:10px;background:#2b8a3e;color:#fff;font-size:14px;text-align:center}
+  #toast.err{background:#b03030}
 </style>
 </head>
 <body>
 <button id="startBtn">Включить мониторинг</button>
 <div id="status">armed</div>
+<div id="toast"></div>
 
 <button id="settingsToggle" title="Настройки">⚙</button>
 <div id="settingsPanel">
   <div id="serverStatus"></div>
   <label>ID трансляции VDO.Ninja
     <input type="text" id="cfgViewId">
-    <div class="hint">часть после ?view= в ссылке</div>
+    <div class="hint">можно вставить ссылку целиком (https://vdo.ninja/?view=…) или только ID</div>
   </label>
 
   <label>Получатели в Telegram
@@ -68,8 +73,8 @@
   <label>Порог громкости, дБ
     <input type="number" id="cfgLoudness" step="1">
   </label>
-  <label>Антидребезг звука, мс
-    <input type="number" id="cfgSoundCooldown" step="1000">
+  <label>Антидребезг звука, с
+    <input type="number" id="cfgSoundCooldown" step="1" min="0">
   </label>
 
   <label>Разрешение видео (детекция движения)
@@ -84,8 +89,12 @@
     <input type="number" id="cfgPercent" step="5" min="1" max="100">
     <div class="hint">доля изменившихся пикселей для срабатывания</div>
   </label>
-  <label>Антидребезг движения, мс
-    <input type="number" id="cfgMotionCooldown" step="1000">
+  <label>Интервал сравнения кадров, с
+    <input type="number" id="cfgMotionInterval" step="0.5" min="0.5">
+    <div class="hint">как часто брать кадр для детекции движения; реже — больше изменений накапливается между кадрами</div>
+  </label>
+  <label>Антидребезг движения, с
+    <input type="number" id="cfgMotionCooldown" step="1" min="0">
   </label>
 
   <button id="saveBtn">Сохранить и перезапустить</button>
@@ -122,11 +131,12 @@ const DEFAULTS = {
   customChatEnabled: false,
   chatCustom: "",
   loudness: 10,
-  soundCooldown: 30000,
+  soundCooldownSec: 30,
   resolution: "240x135",
   pixelDiff: 30,
   percent: 25,
-  motionCooldown: 30000
+  motionIntervalSec: 1.5,
+  motionCooldownSec: 30
 };
 
 /* Режимы работы страницы:
@@ -137,10 +147,22 @@ const DEFAULTS = {
 const SERVER = window.__SERVER__ || null;
 const MODE = SERVER ? SERVER.mode : 'standalone';
 
+// Ссылка вида https://vdo.ninja/?view=ID (или просто ID) -> ID
+function extractViewId(raw) {
+  raw = String(raw || '').trim();
+  const m = raw.match(/[?&#]view=([^&#\s]+)/i);
+  if (!m) return raw;
+  try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
+}
+
 function loadSettings() {
-  if (SERVER) return { ...DEFAULTS, ...(SERVER.settings || {}) };
-  const saved = JSON.parse(localStorage.getItem('vdoAlertSettings') || '{}');
-  return { ...DEFAULTS, ...saved };
+  const saved = SERVER ? (SERVER.settings || {}) : JSON.parse(localStorage.getItem('vdoAlertSettings') || '{}');
+  // миграция: раньше антидребезги хранились в миллисекундах
+  if (saved.soundCooldownSec === undefined && saved.soundCooldown !== undefined) saved.soundCooldownSec = saved.soundCooldown / 1000;
+  if (saved.motionCooldownSec === undefined && saved.motionCooldown !== undefined) saved.motionCooldownSec = saved.motionCooldown / 1000;
+  const c = { ...DEFAULTS, ...saved };
+  c.viewId = extractViewId(c.viewId);
+  return c;
 }
 
 const cfg = loadSettings();
@@ -173,6 +195,8 @@ let prevFrameData = null;
 // Heartbeat для внешнего мониторинга (Python-супервизор):
 window.__lastMessageAt = null;
 window.__connectedAt = null;
+// Время последних реальных данных потока (звук/кадр) — по нему Python решает, идёт ли трансляция
+window.__lastStreamAt = null;
 
 const canvas = document.createElement('canvas');
 canvas.width = SAMPLE_SIZE;
@@ -257,11 +281,24 @@ resSelect.addEventListener('change', updateResolutionHint);
 const fields = {
   cfgViewId: 'viewId',
   cfgLoudness: 'loudness',
-  cfgSoundCooldown: 'soundCooldown',
+  cfgSoundCooldown: 'soundCooldownSec',
   cfgPixelDiff: 'pixelDiff',
   cfgPercent: 'percent',
-  cfgMotionCooldown: 'motionCooldown'
+  cfgMotionInterval: 'motionIntervalSec',
+  cfgMotionCooldown: 'motionCooldownSec'
 };
+
+document.getElementById('cfgViewId').addEventListener('change', e => { e.target.value = extractViewId(e.target.value); });
+
+let toastTimer;
+function showToast(text, isError) {
+  const t = document.getElementById('toast');
+  t.textContent = text;
+  t.className = isError ? 'err' : '';
+  t.style.display = 'block';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.style.display = 'none'; }, isError ? 8000 : 5000);
+}
 for (const [id, key] of Object.entries(fields)) {
   document.getElementById(id).value = cfg[key];
 }
@@ -277,8 +314,8 @@ if (MODE === 'settings') {
   document.getElementById('saveBtn').textContent = 'Сохранить и применить';
   const st = document.getElementById('serverStatus');
   const pollStatus = () => fetch('/api/status').then(r => r.json()).then(s => {
-    st.textContent = `Монитор: ${s.status || 'не запущен'}, связь ${s.connected ? 'есть' : 'нет'}` +
-      (s.lastMessageAgoSec != null ? `, последнее сообщение ${s.lastMessageAgoSec} с назад` : '');
+    st.textContent = `Монитор: ${s.status || 'не запущен'}, поток ${s.connected ? 'идёт' : 'не идёт'}` +
+      (s.lastMessageAgoSec != null ? `, последние данные ${s.lastMessageAgoSec} с назад` : '');
   }).catch(() => { st.textContent = 'Сервер недоступен'; });
   pollStatus();
   setInterval(pollStatus, 3000);
@@ -288,7 +325,7 @@ document.getElementById('saveBtn').addEventListener('click', () => {
   const newCfg = {};
   for (const [id, key] of Object.entries(fields)) {
     const raw = document.getElementById(id).value;
-    if (key === 'viewId') { newCfg[key] = raw.trim(); continue; }
+    if (key === 'viewId') { newCfg[key] = extractViewId(raw); continue; }
     const val = Number(raw);
     newCfg[key] = Number.isNaN(val) ? DEFAULTS[key] : val;
   }
@@ -303,18 +340,21 @@ document.getElementById('saveBtn').addEventListener('click', () => {
   newCfg.customChatEnabled = document.getElementById('chatCustomToggle').checked;
   newCfg.chatCustom = document.getElementById('cfgChatCustom').value.trim();
 
-  const hint = document.getElementById('saveHint');
+  document.getElementById('cfgViewId').value = newCfg.viewId;
   if (SERVER) {
     // через сервер: Python сам перезагрузит страницу монитора и нажмёт «Включить»
+    const btn = document.getElementById('saveBtn');
+    btn.disabled = true;
     fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(newCfg) })
-      .then(r => { if (!r.ok) throw new Error(r.status); hint.textContent = 'Сохранено — монитор на сервере применяет настройки.'; })
-      .catch(() => { hint.textContent = 'Не удалось сохранить на сервере.'; })
-      .finally(() => { hint.style.display = 'block'; });
+      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status);
+                   showToast('✓ Настройки сохранены. Монитор на сервере применяет их и перезапускается.'); })
+      .catch(err => showToast('✗ Не удалось сохранить: ' + err.message, true))
+      .finally(() => { btn.disabled = false; });
     return;
   }
   localStorage.setItem('vdoAlertSettings', JSON.stringify(newCfg));
-  hint.style.display = 'block';
-  setTimeout(() => location.reload(), 600);
+  showToast('✓ Настройки сохранены, страница перезагружается…');
+  setTimeout(() => location.reload(), 900);
 });
 
 /* ---- Wake Lock ---- */
@@ -345,7 +385,7 @@ document.getElementById('startBtn').addEventListener('click', async () => {
 
   iframe.addEventListener('load', () => {
     iframe.contentWindow.postMessage({ getLoudness: true }, '*');
-    setInterval(requestFrame, 1500);
+    setInterval(requestFrame, Math.max(500, cfg.motionIntervalSec * 1000));
   });
 });
 
@@ -366,10 +406,11 @@ window.addEventListener('message', (e) => {
   if (typeof e.data.loudness !== 'undefined' && e.data.mode === 'update') {
     const levels = Object.values(e.data.loudness);
     if (levels.length) {
+      window.__lastStreamAt = Date.now();
       const level = Math.max(...levels);
       if (level > cfg.loudness) {
         const now = Date.now();
-        if (now - lastSoundAlertAt > cfg.soundCooldown) {
+        if (now - lastSoundAlertAt > cfg.soundCooldownSec * 1000) {
           lastSoundAlertAt = now;
           sendTelegramAlert(`🔊 Превышен порог громкости: ${level.toFixed(1)} dB`);
         }
@@ -379,7 +420,7 @@ window.addEventListener('message', (e) => {
 
   if (e.data.action === 'image-frame-capture' && e.data.value && e.data.value.cib === 'motion') {
     const blob = e.data.value.imageData;
-    if (blob instanceof Blob) processFrame(blob);
+    if (blob instanceof Blob) { window.__lastStreamAt = Date.now(); processFrame(blob); }
   }
 });
 
@@ -414,7 +455,7 @@ async function processFrame(blob) {
 
     if (percent > cfg.percent) {
       const now = Date.now();
-      if (now - lastMotionAlertAt > cfg.motionCooldown) {
+      if (now - lastMotionAlertAt > cfg.motionCooldownSec * 1000) {
         lastMotionAlertAt = now;
         sendTelegramAlert(`🎥 Обнаружено движение: ${percent.toFixed(0)}% кадра изменилось`);
       }
