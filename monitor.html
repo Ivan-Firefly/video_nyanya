@@ -33,6 +33,12 @@
   #chatDropdownList label:hover{background:#222}
   #chatDropdownList input[type=checkbox]{width:auto;margin:0}
   #customChatWrap{display:none}
+
+  /* режим «настройки» (страница открыта с другой машины через сервер) */
+  #serverStatus{display:none;font-size:11px;color:#9c9;margin-bottom:4px;word-break:break-word}
+  body.settings-mode #settingsToggle{display:none}
+  body.settings-mode #serverStatus{display:block}
+  body.settings-mode #settingsPanel{display:block;position:static;width:min(420px,92vw);max-height:none}
 </style>
 </head>
 <body>
@@ -41,6 +47,7 @@
 
 <button id="settingsToggle" title="Настройки">⚙</button>
 <div id="settingsPanel">
+  <div id="serverStatus"></div>
   <label>ID трансляции VDO.Ninja
     <input type="text" id="cfgViewId">
     <div class="hint">часть после ?view= в ссылке</div>
@@ -85,6 +92,7 @@
   <div id="saveHint">Настройки сохранены — мониторинг придётся включить кнопкой заново после перезагрузки.</div>
 </div>
 
+<!--SERVER_INJECT-->
 <script>
 /* ============ НАСТРОЙКИ ПОДКЛЮЧЕНИЯ (не меняются через панель) ============ */
 const TELEGRAMBOTTOKEN = "BOT_TOKEN"; // токен от BotFather
@@ -121,7 +129,16 @@ const DEFAULTS = {
   motionCooldown: 30000
 };
 
+/* Режимы работы страницы:
+   standalone — открыта как обычный файл (телефон и т.п.): настройки в localStorage, старт кнопкой;
+   monitor    — открыта питоновским супервизором на сервере: настройки с сервера, старт делает Python;
+   settings   — открыта с другой машины через сервер: только форма настроек, мониторинг не запускается.
+   Режим и настройки подставляет сервер в маркер <!--SERVER_INJECT-->; без сервера маркер — просто комментарий. */
+const SERVER = window.__SERVER__ || null;
+const MODE = SERVER ? SERVER.mode : 'standalone';
+
 function loadSettings() {
+  if (SERVER) return { ...DEFAULTS, ...(SERVER.settings || {}) };
   const saved = JSON.parse(localStorage.getItem('vdoAlertSettings') || '{}');
   return { ...DEFAULTS, ...saved };
 }
@@ -251,8 +268,21 @@ for (const [id, key] of Object.entries(fields)) {
 
 document.getElementById('settingsToggle').addEventListener('click', () => {
   const panel = document.getElementById('settingsPanel');
-  panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+  panel.style.display = getComputedStyle(panel).display === 'none' ? 'block' : 'none';
 });
+
+if (MODE === 'settings') {
+  document.body.classList.add('settings-mode');
+  document.getElementById('startBtn').style.display = 'none';
+  document.getElementById('saveBtn').textContent = 'Сохранить и применить';
+  const st = document.getElementById('serverStatus');
+  const pollStatus = () => fetch('/api/status').then(r => r.json()).then(s => {
+    st.textContent = `Монитор: ${s.status || 'не запущен'}, связь ${s.connected ? 'есть' : 'нет'}` +
+      (s.lastMessageAgoSec != null ? `, последнее сообщение ${s.lastMessageAgoSec} с назад` : '');
+  }).catch(() => { st.textContent = 'Сервер недоступен'; });
+  pollStatus();
+  setInterval(pollStatus, 3000);
+}
 
 document.getElementById('saveBtn').addEventListener('click', () => {
   const newCfg = {};
@@ -273,8 +303,17 @@ document.getElementById('saveBtn').addEventListener('click', () => {
   newCfg.customChatEnabled = document.getElementById('chatCustomToggle').checked;
   newCfg.chatCustom = document.getElementById('cfgChatCustom').value.trim();
 
+  const hint = document.getElementById('saveHint');
+  if (SERVER) {
+    // через сервер: Python сам перезагрузит страницу монитора и нажмёт «Включить»
+    fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(newCfg) })
+      .then(r => { if (!r.ok) throw new Error(r.status); hint.textContent = 'Сохранено — монитор на сервере применяет настройки.'; })
+      .catch(() => { hint.textContent = 'Не удалось сохранить на сервере.'; })
+      .finally(() => { hint.style.display = 'block'; });
+    return;
+  }
   localStorage.setItem('vdoAlertSettings', JSON.stringify(newCfg));
-  document.getElementById('saveHint').style.display = 'block';
+  hint.style.display = 'block';
   setTimeout(() => location.reload(), 600);
 });
 
