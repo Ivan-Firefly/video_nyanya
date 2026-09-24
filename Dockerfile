@@ -1,13 +1,16 @@
-# Официальный образ Playwright уже содержит Chromium и все системные
-# зависимости (libnss3, fonts, libatk и т.д.) — избавляет от ручной
-# установки, которая обычно нужна при headless Chrome в Docker.
-# Версия тега должна совпадать с версией playwright в requirements.txt.
-FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
+FROM python:3.12-slim
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    # Ставим ТОЛЬКО системные зависимости для Chromium (--with-deps),
+    # не трогая Firefox/WebKit — их бинарники даже не скачиваются.
+    && playwright install --with-deps chromium \
+    # Чистим apt-кэш и списки пакетов внутри того же слоя,
+    # иначе они остаются "мёртвым весом" в образе.
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY monitor.py .
 
