@@ -1,5 +1,6 @@
 services:
   vdoninja-monitor:
+    container_name: video_nyanya
     image: firefly27/video_nyanya:latest
     restart: unless-stopped
     network_mode: host
