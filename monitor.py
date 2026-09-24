@@ -22,9 +22,6 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 # ============ НАСТРОЙКИ ЗАПУСКА (из переменных окружения) ============
 HTML_FILE = Path(os.environ.get("HTML_FILE", "/app/html/monitor.html"))
 USER_DATA_DIR = Path(os.environ.get("USER_DATA_DIR", "/app/browser-profile"))
-REMOTE_DEBUG_PORT = int(os.environ.get("REMOTE_DEBUG_PORT", "9223"))
-# Chromium всё равно слушает только 127.0.0.1 (флаг --remote-debugging-address игнорируется),
-# для доступа снаружи используйте SSH-туннель или `tailscale serve`.
 
 # Встроенный сервер: отдаёт monitor.html и принимает настройки (доступен из LAN/tailscale)
 HTTP_BIND = os.environ.get("HTTP_BIND", "0.0.0.0")
@@ -34,7 +31,10 @@ HTML_MARKER = "<!--SERVER_INJECT-->"
 
 RESTART_DELAY_SEC = int(os.environ.get("RESTART_DELAY_SEC", "15"))
 HEALTHCHECK_INTERVAL_SEC = int(os.environ.get("HEALTHCHECK_INTERVAL_SEC", "15"))
-DROPPED_TIMEOUT_SEC = int(os.environ.get("DROPPED_TIMEOUT_SEC", "60"))
+DROPPED_TIMEOUT_SEC = int(os.environ.get("DROPPED_TIMEOUT_SEC", "60"))   # тишина дольше этого = трансляция остановлена
+STREAM_FRESH_SEC = int(os.environ.get("STREAM_FRESH_SEC", "30"))         # данные младше этого = «поток идёт сейчас»
+START_CONFIRM_SEC = int(os.environ.get("START_CONFIRM_SEC", "30"))       # столько поток должен идти непрерывно до сообщения о начале
+NOTIFY_MIN_GAP_SEC = int(os.environ.get("NOTIFY_MIN_GAP_SEC", "120"))    # не чаще одного сообщения о трансляции за это время
 
 LOG_FILE = Path(os.environ.get("LOG_FILE", "/app/logs/vdoninja_monitor.log"))
 # =======================================================================
@@ -53,6 +53,8 @@ _telegram_cache = {"token": None, "chat_ids": []}
 _settings_changed = threading.Event()   # HTTP-поток -> основной цикл: «настройки обновились»
 MONITOR_KEY = secrets.token_urlsafe(16)  # секрет для открытия страницы в режиме monitor
 _state = {"status": None, "connected": False, "lastMessageAgoSec": None}  # для /api/status
+# Состояние трансляции живёт между перезапусками браузерной сессии, чтобы перезагрузка страницы не давала ложных «конец/начало»
+_stream = {"live": False, "announced": False, "ended_before": False, "fresh_since": None, "last_notice_at": float("-inf")}
 
 
 def _handle_sigterm(signum, frame):
@@ -79,21 +81,69 @@ def refresh_telegram_cache(page):
         log.warning(f"Не удалось считать Telegram-настройки со страницы: {e}")
 
 
-def notify(text: str):
+def notify(text: str) -> bool:
+    """True, если сообщение дошло хотя бы одному получателю."""
     token = _telegram_cache.get("token")
     chat_ids = _telegram_cache.get("chat_ids") or []
     if not token or not chat_ids:
         log.warning(f"Нет кэшированных данных Telegram, уведомление не отправлено: {text}")
-        return
+        return False
+    sent = False
     for chat_id in chat_ids:
         try:
-            requests.post(
+            r = requests.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
                 json={"chat_id": chat_id, "text": text},
                 timeout=10,
             )
+            if r.ok:
+                sent = True
+            else:
+                log.warning(f"Telegram вернул {r.status_code} для {chat_id}")
         except Exception as e:
             log.warning(f"Не удалось отправить служебное уведомление в {chat_id}: {e}")
+    return sent
+
+
+def process_stream(now_ms, last_stream_ms, baseline_ms):
+    """
+    Логика уведомлений о трансляции (без спама):
+      * «идёт» = данные потока приходят непрерывно START_CONFIRM_SEC (короткие всплески не считаются);
+      * «остановилась» = данных нет дольше DROPPED_TIMEOUT_SEC (отсчёт не раньше baseline_ms —
+        момента последней перезагрузки страницы, чтобы перезапуск не выглядел как конец трансляции);
+      * шлём сообщение только когда реальное состояние отличается от того, о чём пользователю уже сообщили
+        (после «остановилась» следующее сообщение — только «возобновилась», и наоборот);
+      * не чаще одного сообщения за NOTIFY_MIN_GAP_SEC: если поток мигнул и вернулся раньше —
+        сообщений нет вообще, пользователь и так в курсе актуального состояния.
+    """
+    s = _stream
+    fresh = last_stream_ms is not None and (now_ms - last_stream_ms) < STREAM_FRESH_SEC * 1000
+
+    if fresh:
+        if s["fresh_since"] is None:
+            s["fresh_since"] = now_ms
+        # данные должны продолжать приходить START_CONFIRM_SEC после первого появления (а не просто быть «свежими»)
+        if not s["live"] and last_stream_ms - s["fresh_since"] >= START_CONFIRM_SEC * 1000:
+            s["live"] = True
+            log.info("Данные потока идут — трансляция началась")
+    else:
+        s["fresh_since"] = None
+        silent_ms = now_ms - max(last_stream_ms or 0, baseline_ms)
+        if s["live"] and silent_ms > DROPPED_TIMEOUT_SEC * 1000:
+            s["live"] = False
+            log.warning("Данные потока перестали приходить — трансляция остановлена")
+
+    if s["live"] != s["announced"] and now_ms / 1000 - s["last_notice_at"] >= NOTIFY_MIN_GAP_SEC:
+        if s["live"]:
+            text = ("🟢 Трансляция возобновилась — поток снова приходит." if s["ended_before"]
+                    else "🟢 Трансляция началась — поток приходит, мониторинг работает.")
+        else:
+            text = "🔴 Трансляция остановлена — данные от потока не приходят."
+        if notify(text):  # при неудаче попробуем снова на следующей проверке
+            s["announced"] = s["live"]
+            s["last_notice_at"] = now_ms / 1000
+            if not s["live"]:
+                s["ended_before"] = True
 
 
 # ============ ВСТРОЕННЫЙ HTTP-СЕРВЕР: тот же monitor.html служит и интерфейсом настроек ============
@@ -184,7 +234,6 @@ def run_session():
                 "--disable-gpu",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                f"--remote-debugging-port={REMOTE_DEBUG_PORT}",
             ],
         )
         page = context.pages[0] if context.pages else context.new_page()
@@ -196,7 +245,6 @@ def run_session():
         log.info(f"Открываю страницу мониторинга: http://127.0.0.1:{HTTP_PORT}/ (режим monitor)")
         _settings_changed.clear()
         page.goto(page_url, wait_until="load")
-        log.info(f"Remote debugging: только 127.0.0.1:{REMOTE_DEBUG_PORT}")
 
         refresh_telegram_cache(page)
 
@@ -206,9 +254,8 @@ def run_session():
         except PWTimeoutError:
             log.warning("Кнопка #startBtn не найдена сразу — возможно, ViewID не задан.")
 
-        was_connected = False
-        dropped_notified = False
         last_status = None
+        baseline_ms = time.time() * 1000  # отсчёт «тишины» начинается с запуска страницы
 
         last_check = time.time()
 
@@ -223,8 +270,8 @@ def run_session():
                     page.click("#startBtn", timeout=10000)
                 except Exception as e:
                     log.warning(f"Не удалось применить настройки сразу (подхватит проверка состояния): {e}")
-                was_connected = False
-                dropped_notified = False
+                _stream["fresh_since"] = None
+                baseline_ms = time.time() * 1000
                 last_status = None
                 last_check = time.time()
                 continue
@@ -236,8 +283,7 @@ def run_session():
             try:
                 info = page.evaluate(
                     "() => ({"
-                    "  lastMessageAt: window.__lastMessageAt || null,"
-                    "  connectedAt: window.__connectedAt || null,"
+                    "  lastStreamAt: window.__lastStreamAt || null,"
                     "  status: document.getElementById('status') ? document.getElementById('status').textContent : null,"
                     "  startBtnVisible: !!document.getElementById('startBtn') && "
                     "                   document.getElementById('startBtn').style.display !== 'none'"
@@ -252,8 +298,8 @@ def run_session():
                 try:
                     page.click("#startBtn", timeout=3000)
                     log.info("Страница перезагрузилась — запустил мониторинг снова")
-                    was_connected = False
-                    dropped_notified = False
+                    _stream["fresh_since"] = None
+                    baseline_ms = time.time() * 1000
                 except Exception:
                     pass
                 continue
@@ -263,27 +309,15 @@ def run_session():
                 last_status = info["status"]
 
             now_ms = time.time() * 1000
-            last_msg = info.get("lastMessageAt")
-            connected_at = info.get("connectedAt")
+            last_stream = info.get("lastStreamAt")
 
-            if connected_at:
-                was_connected = True
-                dropped_notified = False
+            process_stream(now_ms, last_stream, baseline_ms)
 
             _state.update(
                 status=info["status"],
-                connected=was_connected,
-                lastMessageAgoSec=round((now_ms - last_msg) / 1000) if last_msg else None,
+                connected=_stream["live"],
+                lastMessageAgoSec=round((now_ms - last_stream) / 1000) if last_stream else None,
             )
-
-            if not was_connected:
-                continue
-
-            if last_msg and (now_ms - last_msg) > DROPPED_TIMEOUT_SEC * 1000:
-                if not dropped_notified:
-                    log.warning("Связь была, но сообщения не приходят — похоже, трансляция закончилась")
-                    notify("🔴 Трансляция закончилась или связь потеряна — сообщения от потока не приходят.")
-                    dropped_notified = True
 
         context.close()
 
@@ -293,8 +327,9 @@ def main():
         log.error(f"Файл не найден: {HTML_FILE}. Проверьте volume-монтирование в docker-compose.yml")
         sys.exit(1)
 
-    if HTML_MARKER not in HTML_FILE.read_text(encoding="utf-8"):
-        log.error(f"В {HTML_FILE} нет маркера {HTML_MARKER} — нужна новая версия monitor.html")
+    html_text = HTML_FILE.read_text(encoding="utf-8")
+    if HTML_MARKER not in html_text or "__lastStreamAt" not in html_text:
+        log.error(f"{HTML_FILE}: устаревшая версия monitor.html (нет {HTML_MARKER} или __lastStreamAt)")
         sys.exit(1)
     server = start_http_server()
 
